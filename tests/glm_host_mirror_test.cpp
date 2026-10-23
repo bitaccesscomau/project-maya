@@ -355,6 +355,42 @@ bool covered(const Model& m) {   // every key exactly one valid host slot
     return true;
 }
 
+// A conversation set aside and restored: the engine writes the RAM tier's slot states by value and slot_load puts
+// them back as the live state.  Closed PR #15 (STRATA_GLM_RAM_SHADOW) did exactly this and crashed with an illegal
+// memory access in the next request's prefill, because its shadows were reclaimable duplicates and the clean-up
+// could free a slot another table still pointed at.  Under the mirror there are no duplicates to free and no slot
+// is ever reused, so a restored state is still one valid host slot per key.
+void set_aside() {
+    Model m = warm(true);
+    CHECK(covered(m));
+    promote(m, 2);
+    boundary(m, true);
+    CHECK(covered(m));
+    // set aside: a copy of the live slot state is what the engine writes out
+    const std::vector<int> key0 = m.key;
+    const std::vector<char> st0 = m.st;
+    const std::vector<int> ram0 = m.ram_of;
+    // the next request runs and moves residency around
+    evict(m, 2);
+    promote(m, 7);
+    boundary(m, true);
+    CHECK(covered(m));
+    // ... then the saved conversation comes back, with its residents
+    m.key = key0;
+    m.st = st0;
+    m.ram_of = ram0;
+    m.vram = {0, 1, 2};
+    CHECK(covered(m));                                    // one valid host slot per expert, nothing dangling
+    for (char c : m.st) CHECK(c == rs::kHold);            // every restored slot is the permanent copy
+    m.d2h = m.retired = m.broken = 0;                     // counters from the restore onward
+    evict(m, 2);                                          // and an eviction after the restore copies nothing back
+    evict(m, 0);
+    CHECK(m.d2h == 0 && m.broken == 0 && m.retired == 2);
+    CHECK(covered(m));                                    // retiring VRAM copies leaves the host table intact
+    boundary(m, true);
+    CHECK(covered(m));
+}
+
 void tier_model() {
     {
         Model m = warm(true);
@@ -405,6 +441,7 @@ int main() {
     legacy_decisions();
     mirror_decisions();
     tier_model();
+    set_aside();
     std::printf("glm_host_mirror_test: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
