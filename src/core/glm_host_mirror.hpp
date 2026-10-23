@@ -30,6 +30,8 @@ enum : char { kFree = 0, kHold = 1, kRelease = 2, kDemote = 3, kNew = 4, kLoad =
 
 // STRATA_GLM_HOST_MIRROR's (and STRATA_GLM_HOST_MIRROR_VERIFY's) value: on for a non-zero number; unset, empty or 0 off
 inline bool host_mirror_on(const char* v) { return v != nullptr && std::atoi(v) != 0; }
+// STRATA_GLM_EVICT_STATS (opt-in eviction counters, generate's `glm evict:` line): read the same way, so =0 is off
+inline bool evict_stats_on(const char* v) { return host_mirror_on(v); }
 
 // ---- capacity.  Each RAM class (one blob stride) holds every expert of every MoE layer of that stride - nothing more:
 //      with the mirror no path needs a free RAM slot (a disk miss cannot happen, an eviction or a prompt's park keeps
@@ -55,7 +57,8 @@ inline bool host_mirror_fits(uint64_t need, int64_t avail, int64_t headroom, int
 }
 // ... and a fixed budget (STRATA_GLM_RAM_GB, or the engine's own; < 0: none) never below the mirror
 inline bool host_mirror_budget_ok(uint64_t need, int64_t budget) { return budget < 0 || (uint64_t) budget >= need; }
-// the start's refusal: per class what it needs and what it got, and why - all or nothing, never a smaller mirror
+// the start's refusal: per class what it needs and what it got, and why - all or nothing, never a smaller mirror.
+// (It never suggests a smaller RAM headroom: that reserve is the OS's and the server's, not expert capacity.)
 inline std::string host_mirror_shortfall(const std::vector<int64_t>& need, const std::vector<int64_t>& got,
                                          const std::vector<size_t>& stride, const std::string& why) {
     std::string s = "glm fast: STRATA_GLM_HOST_MIRROR=1 needs every active expert in pinned RAM (" + why + "):";
@@ -67,8 +70,8 @@ inline std::string host_mirror_shortfall(const std::vector<int64_t>& need, const
         s += b;
     }
     s += "; " + std::to_string(host_mirror_bytes(need, stride)) +
-         " bytes in all. There is no partial mirror: free RAM (MAYA_GLM_RAM_HEADROOM_GB, other programs), lower "
-         "--max-context, or leave MAYA_GLM_HOST_MIRROR off";
+         " bytes in all. There is no partial mirror: free RAM (stop other programs), lower --max-context, or leave "
+         "MAYA_GLM_HOST_MIRROR off";
     return s;
 }
 
@@ -153,6 +156,10 @@ inline bool bg_up_clears_ram_entry(bool mirror) { return !mirror; }
 inline bool host_copy_valid(int key, int rs, int slot_key, char st) {
     return key >= 0 && rs >= 0 && slot_key == key && (st == ram_st::kHold || st == ram_st::kPin);
 }
+// the verification's orphan count (STRATA_GLM_HOST_MIRROR_VERIFY): a resident VRAM slot whose key is booked at another
+// slot or at none (slot_of), a duplicate no table reaches.  Reported, not a failure: the race that can leave one (a
+// background promotion landing while a route promotes the same key) predates the mirror.
+inline bool vram_orphan(bool resident, int booked_slot, int slot) { return resident && booked_slot != slot; }
 // an eviction from VRAM (a spare refill, a background swap): the exclusive tiers copy the blob to RAM (or drop it);
 // the mirror only retires the VRAM copy - and a missing host copy is a broken invariant, never a copy elsewhere
 enum class Evict { kCopy, kRetire, kBroken };

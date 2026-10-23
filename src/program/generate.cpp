@@ -57,6 +57,7 @@
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/core/progress.hpp"
+#include "../core/glm_host_mirror.hpp"   // (host-only switch parsing for the opt-in eviction counters)
 #ifndef NOMINMAX
 #define NOMINMAX   // gguf_reader.hpp includes windows.h
 #endif
@@ -2261,7 +2262,7 @@ static int glm_pack_generate(const Options& o) {
             // STRATA_GLM_EVICT_STATS=1 (opt-in, either arm of the host-mirror A/B): this decode's expert eviction copies
             // VRAM -> RAM a token (copies, MB) and the evictions the host mirror retired without a copy, then the
             // process's totals by path - a spare refill's demotion, a background swap's, a prompt lending's park
-            static const bool evict_stats = getenv("STRATA_GLM_EVICT_STATS") != nullptr;
+            static const bool evict_stats = strata::core::glmfast::evict_stats_on(getenv("STRATA_GLM_EVICT_STATS"));
             if (evict_stats) {
                 uint64_t dn = 0, db = 0, dr = 0;
                 for (int p = 0; p < 3; ++p) {

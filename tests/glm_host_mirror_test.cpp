@@ -4,6 +4,7 @@
 // mirror off every decision must be the exclusive tiers' own (the legacy expressions are written out below).
 // No CUDA or HIP headers, device queries or allocations: fixtures only, never model or service evidence.
 #include "../src/core/glm_host_mirror.hpp"
+#include "../include/strata/platform/env_alias.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -48,6 +49,25 @@ void flag() {
     CHECK(!host_mirror_on("no"));   // (std::atoi: 0, as every STRATA_GLM_* switch reads)
     CHECK(host_mirror_on("1"));
     CHECK(host_mirror_on("2"));
+    // STRATA_GLM_EVICT_STATS reads as the other new switches: unset, empty or 0 off (=0 must not enable it)
+    CHECK(!evict_stats_on(nullptr));
+    CHECK(!evict_stats_on(""));
+    CHECK(!evict_stats_on("0"));
+    CHECK(evict_stats_on("1"));
+}
+
+// the MAYA_ spellings: main() calls env_aliases() first, which copies every MAYA_X to STRATA_X, so the new switches
+// work under either name and =0 stays off
+void aliases() {
+    const char* names[] = {"STRATA_GLM_HOST_MIRROR", "STRATA_GLM_EVICT_STATS", "MAYA_GLM_HOST_MIRROR",
+                           "MAYA_GLM_EVICT_STATS"};
+    for (const char* n : names) unsetenv(n);
+    setenv("MAYA_GLM_HOST_MIRROR", "1", 1);
+    setenv("MAYA_GLM_EVICT_STATS", "0", 1);
+    strata::platform::env_aliases();
+    CHECK(host_mirror_on(std::getenv("STRATA_GLM_HOST_MIRROR")));
+    CHECK(std::getenv("STRATA_GLM_EVICT_STATS") != nullptr && !evict_stats_on(std::getenv("STRATA_GLM_EVICT_STATS")));
+    for (const char* n : names) unsetenv(n);
 }
 
 void capacity() {
@@ -94,6 +114,9 @@ void shortfall() {
     CHECK(m.find("11808 slots needed, 0 obtained") != std::string::npos);
     CHECK(m.find("96478691328") != std::string::npos);
     CHECK(m.find("no partial mirror") != std::string::npos);
+    // the RAM headroom is the OS's and the server's, never expert capacity: the refusal must not suggest lowering it
+    CHECK(m.find("HEADROOM") == std::string::npos);
+    CHECK(m.find("free RAM") != std::string::npos && m.find("--max-context") != std::string::npos);
 }
 
 void conflicts() {
@@ -237,6 +260,12 @@ void mirror_decisions() {
     CHECK(!host_copy_valid(7, 3, 7, rs::kLoad));     // an AHEAD read maybe still in flight
     CHECK(!host_copy_valid(7, 3, 7, rs::kRelease));
     CHECK(!host_copy_valid(-1, 3, -1, rs::kHold));
+    // the verification's orphan count: a resident VRAM slot whose key's booked slot (slot_of) is another slot or none
+    // (a duplicate the tables cannot reach; its bytes may still be right, so (a) and (b) alone miss it)
+    CHECK(!vram_orphan(true, 5, 5));     // the key's own booked slot
+    CHECK(vram_orphan(true, 7, 5));      // the key is booked at slot 7: slot 5 is an orphan duplicate
+    CHECK(vram_orphan(true, -1, 5));     // the key is booked nowhere
+    CHECK(!vram_orphan(false, 7, 5));    // not resident (free, landing, draining, lent): not counted
 }
 
 // A small tier model driven by the decisions in the order the engine applies them: the warm-up, a demand promotion,
@@ -368,6 +397,7 @@ void tier_model() {
 
 int main() {
     flag();
+    aliases();
     capacity();
     fit();
     shortfall();

@@ -4264,8 +4264,9 @@ bool Glm5Model::host_mirror_verify(const char* phase, std::string& err) {
                        (vs >= 0 && (vs >= P.n || P.st[(size_t) vs] != FastState::kResident || P.key[(size_t) vs] != e));
         }
     }
-    // (b) every VRAM copy against its host copy (through the pinned staging)
-    uint64_t vram_n = 0, vram_bad = 0, landing = 0;
+    // (b) every VRAM copy against its host copy (through the pinned staging); and the orphan duplicates, resident
+    //     slots whose key is booked at another slot or none (counted, not a failure: glm_host_mirror.hpp vram_orphan)
+    uint64_t vram_n = 0, vram_bad = 0, landing = 0, orphan = 0;
     for (int il = l0_; il < lt_; ++il) {
         if (!F->L[(size_t) il].moe) continue;
         const auto& P = F->lp[(size_t) il];
@@ -4275,6 +4276,7 @@ bool Glm5Model::host_mirror_verify(const char* phase, std::string& err) {
             int e = -1;
             if (P.st[(size_t) s] == FastState::kResident && P.key[(size_t) s] >= 0) {
                 e = P.key[(size_t) s];
+                orphan += glmfast::vram_orphan(true, F->slot_of[(size_t) (il * NE + e)], s);
             } else if (P.st[(size_t) s] == FastState::kLanding) {
                 for (const auto& m : F->bg)
                     if (m.up && m.il == il && m.vslot == s) e = m.key % NE;
@@ -4334,13 +4336,14 @@ bool Glm5Model::host_mirror_verify(const char* phase, std::string& err) {
     std::fprintf(stderr,
                  "glm host mirror verify CUDA%d %s: %s - %llu keys: %llu without a valid host copy, %llu not in exactly "
                  "one slot, %llu stray RAM slots, %llu RAM-table and %llu VRAM-table entries wrong | VRAM copies %llu "
-                 "compared (%llu landing), %llu differ | host copies %llu compared with the pack, %llu differ | %llu host "
-                 "slots pinned by background moves, %llu invariant failures so far | %.1f s\n",
+                 "compared (%llu landing), %llu differ, %llu orphan duplicate residents | host copies %llu compared with "
+                 "the pack, %llu differ | %llu host slots pinned by background moves, %llu invariant failures so far | "
+                 "%.1f s\n",
                  dev_, phase, pass ? "PASS" : "FAIL", (unsigned long long) keys, (unsigned long long) missing,
                  (unsigned long long) dup, (unsigned long long) stray, (unsigned long long) rtab_bad,
                  (unsigned long long) tab_bad, (unsigned long long) vram_n, (unsigned long long) landing,
-                 (unsigned long long) vram_bad, (unsigned long long) host_n, (unsigned long long) host_bad,
-                 (unsigned long long) pinned, (unsigned long long) broken, sec);
+                 (unsigned long long) vram_bad, (unsigned long long) orphan, (unsigned long long) host_n,
+                 (unsigned long long) host_bad, (unsigned long long) pinned, (unsigned long long) broken, sec);
     if (!pass) err = std::string("glm host mirror verify failed ") + phase;
     return pass;
 }
