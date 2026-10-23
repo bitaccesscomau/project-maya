@@ -2258,6 +2258,34 @@ static int glm_pack_generate(const Options& o) {
                              (double) kv.misses * kv.block_bytes / 1048576.0,
                              kv.overflow ? " - OVERFLOW (too few resident positions)" : "");
             }
+            // STRATA_GLM_EVICT_STATS=1 (opt-in, either arm of the host-mirror A/B): this decode's expert eviction copies
+            // VRAM -> RAM a token (copies, MB) and the evictions the host mirror retired without a copy, then the
+            // process's totals by path - a spare refill's demotion, a background swap's, a prompt lending's park
+            static const bool evict_stats = getenv("STRATA_GLM_EVICT_STATS") != nullptr;
+            if (evict_stats) {
+                uint64_t dn = 0, db = 0, dr = 0;
+                for (int p = 0; p < 3; ++p) {
+                    dn += st2.evict_d2h[p] - st1.evict_d2h[p];
+                    db += st2.evict_d2h_bytes[p] - st1.evict_d2h_bytes[p];
+                    dr += st2.mirror_retired[p] - st1.mirror_retired[p];
+                }
+                std::fprintf(stderr,
+                             "glm evict: decode %.2f d2h/tok %.2f MB/tok, %.2f retired/tok | totals: d2h spare %llu "
+                             "(%llu B) swap %llu (%llu B) park %llu (%llu B), retired spare %llu swap %llu park %llu, "
+                             "mirror failures %llu\n",
+                             (double) dn / n, (double) db / 1e6 / n, (double) dr / n,
+                             (unsigned long long) st2.evict_d2h[0], (unsigned long long) st2.evict_d2h_bytes[0],
+                             (unsigned long long) st2.evict_d2h[1], (unsigned long long) st2.evict_d2h_bytes[1],
+                             (unsigned long long) st2.evict_d2h[2], (unsigned long long) st2.evict_d2h_bytes[2],
+                             (unsigned long long) st2.mirror_retired[0], (unsigned long long) st2.mirror_retired[1],
+                             (unsigned long long) st2.mirror_retired[2], (unsigned long long) st2.mirror_broken);
+            }
+        }
+        // STRATA_GLM_HOST_MIRROR_VERIFY=1 (diagnostics runs only): the host mirror checked in full after the request,
+        // the prompt's loan returned and every move landed (after DONE: the client is not kept waiting)
+        if (model.fast()) {
+            std::string verr;
+            if (!model.host_mirror_verify("after a request", verr)) std::fprintf(stderr, "glm host mirror: %s\n", verr.c_str());
         }
         model.set_follow({});
         // STRATA_GLM_SPEC_FOLLOW_SAVE: this request's decoded ids, the continuation another run can follow
