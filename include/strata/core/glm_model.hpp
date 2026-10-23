@@ -134,8 +134,17 @@ public:
         double ms = 0, miss_ms = 0, disk_ms = 0, cpu_ms = 0;
         int64_t pool_slots = 0, pool_used = 0, ram_slots = 0, ram_used = 0;
         double pool_gb = 0, ram_gb = 0;
+        // expert evictions VRAM -> RAM by path ([0] spare refill, [1] background swap, [2] a prompt lending's park):
+        // the D2H copies and their bytes, and those the host mirror (STRATA_GLM_HOST_MIRROR) retired without a copy
+        uint64_t evict_d2h[3] = {0, 0, 0}, evict_d2h_bytes[3] = {0, 0, 0}, mirror_retired[3] = {0, 0, 0};
+        uint64_t mirror_broken = 0;   // the host mirror's invariant failures (a key found without its host copy)
     };
     FastStats fast_stats() const;
+    /// STRATA_GLM_HOST_MIRROR_VERIFY=1 (diagnostics, never in a timed run): every active expert's host-mirror blob
+    /// against the pack, every VRAM copy against its host copy, and each key's one permanent host slot and table
+    /// entries - with every stream idle.  Prints one PASS / FAIL line; true without the setting.  `phase` names the
+    /// point in the line.
+    bool host_mirror_verify(const char* phase, std::string& err);
     /// What a part holds on its GPU, in bytes (generate's VRAM lines, the Monitor's map of a GPU): the device's total
     /// and free memory now, its PCI address (the server finds the GPU NVML numbers by it), the dense weights, the
     /// sequence state (the DSA latent cache, KDA states, indexer keys; kv_ram: KV streaming's pinned copy in RAM), the

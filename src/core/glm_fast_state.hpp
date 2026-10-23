@@ -9,6 +9,7 @@
 #include "strata/kernels/glm_kv_stream.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "glm_memory.hpp"
+#include "glm_host_mirror.hpp"
 #include "glm_layer_graphs.hpp"
 
 #include "ggml.h"
@@ -587,6 +588,13 @@ struct Glm5Model::FastState {
     // kRPin: still the expert's live copy, being promoted (never a victim until the copy landed)
     enum : char { kRFree = 0, kRHold = 1, kRRelease = 2, kRDemote = 3, kRNew = 4, kRLoad = 5, kRPin = 6,
                   kRHelper = 7 };   // helper-owned UMA weights: readable by prefill, never a RAM-tier victim
+    // (the host mirror's decisions take these states by value: glmfast::ram_st)
+    static_assert((int) kRFree == (int) glmfast::ram_st::kFree && (int) kRHold == (int) glmfast::ram_st::kHold &&
+                      (int) kRRelease == (int) glmfast::ram_st::kRelease &&
+                      (int) kRDemote == (int) glmfast::ram_st::kDemote && (int) kRNew == (int) glmfast::ram_st::kNew &&
+                      (int) kRLoad == (int) glmfast::ram_st::kLoad && (int) kRPin == (int) glmfast::ram_st::kPin &&
+                      (int) kRHelper == (int) glmfast::ram_st::kHelper,
+                  "glm_host_mirror.hpp's RAM-slot states must match FastState's");
     struct RamClass {
         size_t stride = 0;
         uint8_t* base = nullptr;   // the first piece (the only one unless per_part > 0)
@@ -613,6 +621,18 @@ struct Glm5Model::FastState {
     std::vector<RamClass> rc;
     std::vector<int> layer_rc;   // layer -> RAM class
     std::vector<int> ram_of;     // key -> slot in its class, -1
+    // ---- STRATA_GLM_HOST_MIRROR=1 (off by default; glm_host_mirror.hpp): the RAM tier holds EVERY active expert in
+    //      one pinned slot for the model's lifetime (kRHold, or kRPin while a background promotion reads it) - the
+    //      warm-up fills it and seeds VRAM from it; promotions, the boundary's clean-up, the RAM victims, the free-slot
+    //      reserve and the prompt's lending never release or overwrite it, and an eviction from VRAM only retires the
+    //      VRAM copy (no D2H).  ram_of and the device's RAM table stay valid while the expert is also in VRAM.
+    bool host_mirror = false;
+    bool mirror_verify = false;   // STRATA_GLM_HOST_MIRROR_VERIFY=1: full-byte checks after the warm-up and each request
+    // expert eviction copies VRAM -> RAM (D2H), counted in either mode by path - [0] a spare refill's demotion, [1] a
+    // background swap's demotion, [2] a prompt lending's park - and their bytes; with the mirror the evictions that
+    // retired the VRAM copy without a copy instead, and invariant failures (a key without its host copy)
+    std::atomic<uint64_t> evict_d2h[3] = {0, 0, 0}, evict_d2h_bytes[3] = {0, 0, 0}, mirror_retired[3] = {0, 0, 0};
+    std::atomic<uint64_t> mirror_broken{0};
     // STRATA_GLM_TIER_DIAG=1 (debug): how each expert last left the tiers (0 never held, 1 dropped from VRAM, 2 evicted
     // from RAM, 3 dropped by the prompt path's lending, 4 evicted from RAM by the lending's park), and the disk reads by
     // that cause

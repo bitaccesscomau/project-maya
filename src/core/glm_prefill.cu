@@ -1725,6 +1725,25 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
         // across many GPUs - the RAM tier holds little else, and every lent expert was a ~20 ms disk read back)
         std::vector<char> parked;   // (keys parked by this lending: never its victims - one table edit per key)
         const auto park = [&](int il, int s, int key) -> bool {
+            // the host mirror: the expert's permanent host copy is already there (ram_of and the RAM table point at
+            // it) - nothing to copy, no victim; decided before the discard choice (and the start refuses LEND_DROP with
+            // the mirror).  A missing copy is a broken invariant: the lending fails rather than lose the expert
+            if (glmfast::park_mode(F->host_mirror, lend_drop, F->layer_rc[(size_t) il] >= 0) == glmfast::Park::kKeep) {
+                const int c = F->layer_rc[(size_t) il];
+                const int hs = F->ram_of[(size_t) key];
+                const auto* R = c >= 0 ? &F->rc[(size_t) c] : nullptr;
+                if (R == nullptr || !glmfast::host_copy_valid(key, hs, hs >= 0 ? R->key[(size_t) hs] : -1,
+                                                              hs >= 0 ? R->st[(size_t) hs] : (char) FastState::kRFree)) {
+                    F->mirror_broken.fetch_add(1, std::memory_order_relaxed);
+                    err = "glm lending: STRATA_GLM_HOST_MIRROR=1: layer " + std::to_string(il) + " expert " +
+                          std::to_string(key % NE) + " has no host copy";
+                    ok = false;
+                    return false;
+                }
+                (void) s;
+                F->mirror_retired[2].fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
             if (lend_drop || F->layer_rc[(size_t) il] < 0) return false;
             if (parked.empty()) parked.assign(F->cnt.size(), 0);
             auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
@@ -1746,7 +1765,8 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
                 uint32_t bc = F->cnt[(size_t) key], bu = use(key);
                 uint64_t bt = F->lp[(size_t) il].tick[(size_t) s];
                 for (int s2 = 0; s2 < R.n; ++s2) {
-                    if (R.st[(size_t) s2] != FastState::kRHold || parked[(size_t) R.key[(size_t) s2]]) continue;
+                    if (!glmfast::ram_victim_eligible(F->host_mirror, R.st[(size_t) s2]) || parked[(size_t) R.key[(size_t) s2]])
+                        continue;
                     const int k2 = R.key[(size_t) s2];
                     const uint32_t c = F->cnt[(size_t) k2], u = use(k2);
                     const uint64_t t = R.tick[(size_t) s2];
@@ -1771,6 +1791,8 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
                 ok = false;
                 return false;
             }
+            F->evict_d2h[2].fetch_add(1, std::memory_order_relaxed);
+            F->evict_d2h_bytes[2].fetch_add(F->L[(size_t) il].blob, std::memory_order_relaxed);
             R.key[(size_t) rs] = key;
             R.tick[(size_t) rs] = F->clock;
             R.st[(size_t) rs] = FastState::kRHold;
