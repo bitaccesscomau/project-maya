@@ -23,6 +23,7 @@
 #include "strata/core/layout.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
+#include "strata/program/ckpt_tail.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -1635,15 +1636,13 @@ static int glm_pack_generate(const Options& o) {
         // it fit one prompt chunk together, that mark is dropped and the two are read in one call: every call streams
         // the layers' experts to the GPU again, so a short last piece pays all of that for a few tokens (an RTX 3090 on
         // PCIe 3.0, EXL3-sc_2.60bpw, 64K: 16,384 tokens 20 s, 1,440 tokens 8.0 s, 229 tokens 6.1 s).  The periodic
-        // checkpoint there is not kept; the turns' always are
+        // checkpoint there is not kept; the turns' always are (ckpt_tail_merge, tested in tests/core/ckpt_tail_test.cpp)
         static const bool tail_merge = [] {
             const char* v = getenv("STRATA_GLM_CKPT_TAIL");
             return v != nullptr && atoi(v) != 0;
         }();
         const size_t chunk = tail_merge && model.fast() ? (size_t) std::max(0, model.prefill_chunk()) : 0;
-        while (chunk > 0 && !kept.empty() && std::find(turns.begin(), turns.end(), kept.back()) == turns.end() &&
-               end - (kept.size() >= 2 ? kept[kept.size() - 2] : from) <= chunk)
-            kept.pop_back();
+        strata::program::ckpt_tail_merge(kept, chunk, turns, from, end);
         return kept;
     };
     // ... and with the disk slots on, the state at the end of the system prompt (p) also into a slot of its own: the

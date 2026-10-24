@@ -444,6 +444,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       set_tests_properties(${_t} PROPERTIES TIMEOUT 60)
     endif()
   endforeach()
+  # MAYA_GLM_CKPT_TAIL: which periodic checkpoints a prompt read in pieces keeps (ckpt_tail_merge).  CPU only: the
+  # decision is a pure function of the marks, the chunk size and the read's bounds, so it needs no engine or GPU
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/ckpt_tail_test.cpp")
+    enable_testing()
+    add_executable(ckpt_tail_test tests/core/ckpt_tail_test.cpp)
+    add_test(NAME ckpt_tail_test COMMAND ckpt_tail_test)
+    set_tests_properties(ckpt_tail_test PROPERTIES TIMEOUT 60)
+  endif()
 
   # `strata generate` (P2.S6).  The FIRST user-facing program: everything under it is a component, and this is
   # what composes them into a token.  No tokenizer - the prompt arrives as ids - because Gate C1 compares logits
