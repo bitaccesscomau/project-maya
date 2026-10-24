@@ -4,6 +4,59 @@ Every release is on GitHub (Releases) with these notes; every published change m
 dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.26 - 2026-10-23
+
+DeepSeek reads prompts up to 1.5x faster on NVIDIA V100s and faster on every NVIDIA GPU, its long tool calls stream,
+and fixes for two-GPU Windows setups and the benchmark.
+
+- **DeepSeek prompts on Volta and Turing** (V100, RTX 20): the sparse attention now runs on their FP16 tensor cores,
+  like RTX 30 and newer since v1.1.24 - twice as fast as before on a V100, as exact as the old path (the held-out
+  KL against the original model the same). `DS4_ATTN_V7=0` turns it off.
+- **DeepSeek prompts on every NVIDIA GPU:** a prompt's busiest experts are decoded to FP16 once and multiplied by the
+  library's GEMM instead of being decoded again for every 64 rows (`DS4_FAT_ROWS`, 64 rows by default; 0: off), and
+  cards of 16-32 GB get wider attention slabs (fewer FP16 decodes of the same weights). Together on three V100s:
+  2K-token prompts ~1.3x, 8K and 32K ~1.5x faster; decode the same.
+- **DeepSeek prompts, more:** the expert copies keep going while the host waits for the routing (#360, @OscarSheng);
+  prompt skip across a 2-GPU layer split (#343, @Gazelle221B); `--tp 1` on one GPU takes the chunked prompt path
+  (#320, @pietroMastro92); tensor parallel 2 on Maya's quants, opt-in `MAYA_DS4_TP_GGUF_UNEVEN` (#408, @pepuscz).
+- **DeepSeek decode:** two cores left free beside the CPU lane where it would take every logical CPU (#359,
+  @OscarSheng; with SMT only where it helps, settable with `MAYA_DS4_LANE_FREE`); the CPU lane prefetches only the
+  expert pages not already in RAM - Windows decode +6-7% (#425, @cryptedy).
+- **GLM prompts on Volta:** the prompt attention in one pass (#335, @merbanan) - long prompts ~8% faster on a V100.
+- **DeepSeek tool calls:** a long string argument (a file's content) streams as it is written, so clients with a
+  stream-idle timeout no longer give up while the model is still writing (#403).
+- **Windows, GLM on two GPUs:** the RAM tier is pinned in pieces of at most 1 GB, so the second GPU gets its share of
+  Windows' pinning budget instead of 0 GB and the start no longer fails (#417). `MAYA_GLM_PIN_PIECE_MB=0`: one block.
+- **Fixes:** the server's queue no longer stays blocked after an engine restart handed out a request number still in
+  use (#330, @jettoblack); `--bench` sends DeepSeek its own chat format and `--report` shows DeepSeek's placement and
+  speed lines and its pictures setting (#416); `--mmap-experts` is a setup option kept by later setups (#422).
+
+## v1.1.25 - 2026-10-23
+
+Several conversations at once on GLM get faster, DeepSeek keeps conversations across switches and restarts, and a
+batch of fixes - among them DeepSeek's EXL3 setup and its thinking budget.
+
+- **DeepSeek EXL3 setup** no longer stops at the pack step ("keeps dense weights in FP8", #376): since v1.1.21 every
+  fresh EXL3 setup did. A download already made carries on from the pack step.
+- **DeepSeek keeps conversations** across switches and restarts, so agents with sub-agents stop re-reading their
+  prompts: opt-in, `MAYA_DS4_SLOT_KEEP=1` (#356, @mrsirg97-rgb). A retried prompt or a re-rendered turn is taken back at
+  the conversation's checkpoints (#394, @mgabor3141).
+- **DeepSeek's thinking budget** (`thinking_budget` in the config) is kept: the reasoning ends there and the answer
+  follows (#363). A 1..100 `reasoning_effort` shows as itself at the start.
+- **DeepSeek decode:** the PCIe lane is now judged over whole decode steps too, and streams only where the token gets
+  faster (#329). `DS4_STREAM_TOKEN_AB=0` keeps the earlier check alone.
+- **GLM, several conversations at once** (`--parallel`, @somnergy): MTP drafting in the batched steps
+  (`MAYA_GLM_MULTI_MTP`, #385) and the rows' attention and small kernels in one launch (`MAYA_GLM_ROWS_ATTN` /
+  `_ROWS_SMALL`, #391); running requests keep decoding while a new prompt is read (`MAYA_GLM_PREFILL_INTERLEAVE` /
+  `_GAPS`, #386; `MAYA_GLM_PREFILL_MIN_CHUNKS`, #392); a conversation's system prompt is kept in a slot, so new
+  conversations restore it instead of reading it again (#387). All opt-in except #387's, which is on with the slots.
+- **GLM EXL3 prompts:** short chunks on the tensor cores, `MAYA_GLM_EXL3_MMA_ROWS_SHORT` - 2K-token prompts 28% faster
+  on the contributor's PC (#388, @somnergy).
+- **Fixes:** the server no longer answers "exceeds the context (0)" to every request after an engine that died could
+  not start again - each request tries again, or says why it cannot (#351); `--speed-calibration` measures DeepSeek's
+  DSpark drafter again (#393); the Monitor finds an engine started through a launcher (#398, @somnergy); the pack's MTP
+  message no longer reads as drafting off (#327); docs on the CPU lane's threads (#390, @somnergy).
+
 ## v1.1.24 - 2026-10-22
 
 A fix for DeepSeek on two NVIDIA GPUs under Windows, faster DeepSeek prompts on NVIDIA RTX 30 and newer and on RDNA 4,

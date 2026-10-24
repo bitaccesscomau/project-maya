@@ -663,6 +663,28 @@ bool Glm5Model::fast_setup(std::string& err) {
     F->ram_resident = getenv("STRATA_GLM_RAM_RESIDENT") != nullptr && std::atoi(getenv("STRATA_GLM_RAM_RESIDENT")) != 0;
     if (const char* rs = getenv("STRATA_GLM_RAM_SLACK")) F->ram_slack = std::max(0, std::atoi(rs));
     else if (F->ram_resident) F->ram_slack = 16;
+    // the permanent host mirror (STRATA_GLM_HOST_MIRROR=1, glm_host_mirror.hpp): every active expert in pinned RAM for
+    // the model's lifetime.  The settings it cannot run with stop the start here, before anything is allocated
+    F->host_mirror = glmfast::host_mirror_on(getenv("STRATA_GLM_HOST_MIRROR"));
+    F->mirror_verify = glmfast::host_mirror_on(getenv("STRATA_GLM_HOST_MIRROR_VERIFY"));
+    if (F->mirror_verify && !F->host_mirror) {
+        err = "glm fast: STRATA_GLM_HOST_MIRROR_VERIFY=1 checks the host mirror: it needs STRATA_GLM_HOST_MIRROR=1";
+        return false;
+    }
+    if (F->host_mirror) {
+        glmfast::HostMirrorSettings hm;
+        glmfast::host_mirror_read_env(hm);
+        hm.parts = n_parts_;
+        hm.unified = F->unified_memory;
+        hm.drafting = dflash_on_ || mtp_il_ >= 0;
+        hm.grouped = glmfast::group_experts_on() && rows_ != nullptr;
+        hm.seqs = seq_count();
+        const std::string why = glmfast::host_mirror_conflicts(hm);
+        if (!why.empty()) {
+            err = "glm fast: STRATA_GLM_HOST_MIRROR=1 cannot run with: " + why;
+            return false;
+        }
+    }
     if (cudaStreamCreateWithFlags(&F->cs, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithFlags(&F->copy, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithFlags(&F->ps, cudaStreamNonBlocking) != cudaSuccess ||
@@ -967,6 +989,17 @@ bool Glm5Model::fast_setup(std::string& err) {
             std::fprintf(stderr, "glm mtp: CUDA%d %s - decoding token by token\n", dev_, werr.c_str());
         }
     }
+    // several conversations drafting with the NextN block (STRATA_GLM_MULTI_MTP, glm_mtp_rows.cu): the commit's replay
+    // scratch on every part; on the part with the block, its cache rows' buffers and the draft head's rows - the
+    // drafts are fed from the host (no token_embd on the device) - before the pool too
+    if (multi_mtp_setting() > 0 && !dflash_on_) {
+        if (!mtpw_setup(err)) return false;
+        if (mtp_il_ >= 0 && !mtp_dec_) {
+            if (!mtp_cache_setup(err)) return false;
+            // the draft vocabulary's rows are gathered from a GGUF-typed head; an EXL3 head drafts over all of it
+            if (ws_map_.at("output.weight").type < (int) GGML_TYPE_COUNT) mtp_draft_setup(false);
+        }
+    }
     {
         size_t f1 = 0, t1 = 0;
         cudaMemGetInfo(&f1, &t1);
@@ -1009,10 +1042,14 @@ bool Glm5Model::fast_setup(std::string& err) {
         // answer slots, the grouping) is the verify window's, its rows a window's tokens (win_alloc).  Both before the
         // pool takes the card.
         if (glmfast::group_experts_on() && rows_ != nullptr) {
-            const int R = std::min(rows_max(), n_parts_ > 1 ? split_rows_setting() : seq_count());
+            // (STRATA_GLM_MULTI_MTP: a group's verify windows take more rows than it has conversations - the rows past
+            // the conversations' own name earlier rows' slots, and group only while every expert is in VRAM)
+            const int mm = multi_mtp_setting() > 0 ? multi_mtp_cap() : 0;
+            const int R = std::min(mm > 0 ? 8 : rows_max(), n_parts_ > 1 ? split_rows_setting() : seq_count());
+            const int RT = std::max(R, mm);
             if (R >= 2) {
                 const size_t extra = (size_t) (R - 1) * 8 * sstride;
-                std::vector<unsigned long long> sp((size_t) R * 8);
+                std::vector<unsigned long long> sp((size_t) RT * 8);
                 if (cudaMalloc(&F->rows_scratch, extra) != cudaSuccess ||
                     cudaMalloc((void**) &F->rows_scr, sp.size() * sizeof(unsigned long long)) != cudaSuccess) {
                     cudaGetLastError();
@@ -1020,8 +1057,10 @@ bool Glm5Model::fast_setup(std::string& err) {
                           " MB) did not allocate";
                     return false;
                 }
-                for (size_t i = 0; i < sp.size(); ++i)
-                    sp[i] = (unsigned long long) (i < 8 ? F->scratch + i * sstride : F->rows_scratch + (i - 8) * sstride);
+                for (size_t i = 0; i < sp.size(); ++i) {
+                    const size_t j = i % ((size_t) R * 8);
+                    sp[i] = (unsigned long long) (j < 8 ? F->scratch + j * sstride : F->rows_scratch + (j - 8) * sstride);
+                }
                 cudaMemcpy(F->rows_scr, sp.data(), sp.size() * sizeof(unsigned long long), cudaMemcpyHostToDevice);
                 F->scratch_bytes += extra;
                 size_t f0 = 0, f1 = 0, tot = 0;
@@ -1031,6 +1070,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                 F->win_bytes += f0 > f1 ? f0 - f1 : 0;
                 cpu_win_alloc(F, g, exl3_);   // the merged CPU lane's rows (win_cpu_merged)
                 F->rows_group = R;
+                F->rows_scr_rows = RT;
                 std::fprintf(stderr, "glm fast: CUDA%d grouped rows' experts (STRATA_GLM_GROUP_EXPERTS): up to %d rows, "
                              "%.0f MB of scratch slots and %.0f MB of route state\n", dev_, R, (double) extra / 1e6,
                              (double) (f0 > f1 ? f0 - f1 : 0) / 1e6);
@@ -1577,6 +1617,30 @@ bool Glm5Model::fast_setup(std::string& err) {
             cls_cap[c] = std::max<int64_t>(1, (int64_t) (cls_weight[c] / (double) cls_stride[c])) + 16;
             cls_n[c] = std::min<int64_t>(n, cls_cap[c]);
         }
+        // the host mirror: each class exactly every expert of its layers (glm_host_mirror.hpp: no path needs a free RAM
+        // slot then), all or nothing - the budget above never shrinks it.  What is free now must hold it beside the
+        // headroom for the OS and server and the pin room the driver keeps (a fixed budget: within that)
+        std::vector<int64_t> mirror_need;
+        if (F->host_mirror) {
+            mirror_need = glmfast::host_mirror_slots(F->layer_rc, (int) cls_stride.size(), g.n_expert);
+            for (size_t c = 0; c < cls_stride.size(); ++c) cls_cap[c] = cls_n[c] = mirror_need[c];
+            const uint64_t need_b = glmfast::host_mirror_bytes(mirror_need, cls_stride);
+            const int64_t fixed_b = ram_budget_ >= 0 ? ram_budget_ : fixed_ram ? total : -1;
+            const int64_t now_b = fixed_b >= 0 ? 0 : avail_ram_now();
+            if (!glmfast::host_mirror_budget_ok(need_b, fixed_b) ||
+                !glmfast::host_mirror_fits(need_b, now_b, head_b + unseen_pf, (int64_t) kPinRoom)) {
+                char why[256];
+                if (fixed_b >= 0)
+                    std::snprintf(why, sizeof why, "the fixed RAM budget is %.2f GB", (double) fixed_b / 1073741824.0);
+                else
+                    std::snprintf(why, sizeof why, "%.2f GB of RAM free, %.2f GB of headroom and %.2f GB of pin room "
+                                  "kept", (double) now_b / 1073741824.0, (double) (head_b + unseen_pf) / 1073741824.0,
+                                  (double) kPinRoom / 1073741824.0);
+                err = glmfast::host_mirror_shortfall(mirror_need, std::vector<int64_t>(mirror_need.size(), 0),
+                                                     cls_stride, why);
+                return false;
+            }
+        }
         // parallel load: take the planned size from the budget and let the next part plan; every part pins once all
         // have planned (a later part's measurement then sees no tier half pinned)
         if (split_load_ != nullptr) {
@@ -1621,9 +1685,95 @@ bool Glm5Model::fast_setup(std::string& err) {
             const double f = (double) std::max<int64_t>(0, pin_left - (int64_t) kPinRoom) / (double) std::max<int64_t>(1, planned);
             return (int64_t) (f * (double) cls_n[c]);
         };
+        // a class pinned in pieces of at most STRATA_GLM_PIN_PIECE_MB (Windows: 1024 by default; 0: one block, as on
+        // Linux): a block of many GB takes far more of Windows' per-process pinning budget than its size - 61 GB pin in
+        // 1 GB pieces where the largest single block is ~21 GB - so a 2-GPU split's first part left its second 0 GB and
+        // the start failed (#417)
+        static const int64_t piece_mb = getenv("STRATA_GLM_PIN_PIECE_MB") ? std::atoll(getenv("STRATA_GLM_PIN_PIECE_MB"))
+#ifdef _WIN32
+                                                                          : 1024;
+#else
+                                                                          : 0;
+#endif
+        const auto pin_tier = [&](FastState::RamClass& R, int64_t n) -> void* {
+            if (R.per_part <= 0) {
+                void* q = nullptr;
+                return pin_alloc(&q, (size_t) n * R.stride, cudaHostAllocPortable) == cudaSuccess ? q : nullptr;
+            }
+            R.parts.clear();
+            for (int64_t s = 0; s < n; s += R.per_part) {
+                void* q = nullptr;
+                const size_t bytes = (size_t) std::min<int64_t>(R.per_part, n - s) * R.stride;
+                if (pin_alloc(&q, bytes, cudaHostAllocPortable) != cudaSuccess) {
+                    for (size_t i = 0; i < R.parts.size(); ++i)
+                        pin_free(R.parts[i], (size_t) std::min<int64_t>(R.per_part, n - (int64_t) i * R.per_part) * R.stride);
+                    R.parts.clear();
+                    return nullptr;
+                }
+                R.parts.push_back((uint8_t*) q);
+            }
+            return R.parts.empty() ? nullptr : R.parts[0];
+        };
+        const auto unpin_tier = [&](FastState::RamClass& R, void* p, int64_t n) {
+            if (R.per_part <= 0) {
+                pin_free(p, (size_t) n * R.stride);
+                return;
+            }
+            for (size_t i = 0; i < R.parts.size(); ++i)
+                pin_free(R.parts[i], (size_t) std::min<int64_t>(R.per_part, n - (int64_t) i * R.per_part) * R.stride);
+            R.parts.clear();
+        };
         for (size_t c = 0; c < cls_stride.size() && wsum > 0; ++c) {
             auto& R = F->rc[c];
             R.stride = cls_stride[c];
+            R.per_part = piece_mb > 0 ? (int) std::max<int64_t>(1, (piece_mb << 20) / (int64_t) R.stride) : 0;
+            if (F->host_mirror) {
+                // the mirror pins the class's whole region as ONE mapping (slot() then reads base + s * stride); the
+                // per-part pinning above is the exclusive tiers' (they pin piece by piece to stay under the budget)
+                R.per_part = 0;
+                R.parts.clear();
+                // all or nothing: the class's whole mirror pins in one piece with the pin room still pinnable above it,
+                // or the start ends naming every class's need and what would pin - never a smaller mirror
+                const int64_t n = cls_n[c];
+                const size_t bytes = (size_t) n * R.stride;
+                void* p = numa_pinned(bytes);   // (over every socket where there are several)
+                if (p != nullptr) {
+                    R.registered = true;
+                } else if (pin_alloc(&p, bytes, cudaHostAllocPortable) != cudaSuccess) {
+                    cudaGetLastError();
+                    p = nullptr;
+                }
+                bool room = p != nullptr;
+                if (room) {
+                    void* q = nullptr;
+                    if (pin_alloc(&q, kPinRoom, cudaHostAllocDefault) == cudaSuccess) {
+                        pin_free(q, kPinRoom);
+                    } else {
+                        cudaGetLastError();
+                        room = false;
+                    }
+                }
+                if (!room) {
+                    if (p != nullptr && R.registered) numa_pinned_free(p, bytes);
+                    else if (p != nullptr) pin_free(p, bytes);
+                    R.registered = false;
+                    std::vector<int64_t> got(cls_n.size(), 0);
+                    for (size_t k = 0; k < c; ++k) got[k] = F->rc[k].n;
+                    const int64_t pinnable = pin_room((int64_t) bytes + (int64_t) kPinRoom) - (int64_t) kPinRoom;
+                    got[c] = std::min<int64_t>(n, std::max<int64_t>(0, pinnable) / (int64_t) R.stride);
+                    err = glmfast::host_mirror_shortfall(cls_n, got, cls_stride,
+                                                         "pinning refused class " + std::to_string(c) +
+                                                             " with the pin room kept; later classes not tried");
+                    return false;
+                }
+                R.base = (uint8_t*) p;
+                R.n = (int) n;
+                R.key.assign((size_t) n, -1);
+                R.st.assign((size_t) n, FastState::kRFree);
+                R.tick.assign((size_t) n, 0);
+                F->ram_bytes += bytes;
+                continue;
+            }
             int64_t n = cls_n[c];
             const int64_t cap = cls_cap[c];
             const int64_t least = std::min<int64_t>(16, cap);   // the floor, or the whole cap when that is smaller
@@ -1634,9 +1784,10 @@ bool Glm5Model::fast_setup(std::string& err) {
             for (int tries = 0; n >= least; ++tries) {
                 if ((p = numa_pinned((size_t) n * R.stride)) != nullptr) {   // (over every socket: numa_pinned)
                     R.registered = true;
+                    R.per_part = 0;   // (one mapping)
                     break;
                 }
-                if (pin_alloc(&p, (size_t) n * R.stride, cudaHostAllocPortable) == cudaSuccess) {
+                if ((p = pin_tier(R, n)) != nullptr) {
                     // ... and leave room under the cap: a pageable copy needs pinned buffers of the driver's own, and
                     // with two tiers pinned right up to it the warmed tables' upload failed (#105).  512 MB more that
                     // will not pin: a step less
@@ -1646,7 +1797,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                         break;
                     }
                     cudaGetLastError();
-                    pin_free(p, (size_t) n * R.stride);
+                    unpin_tier(R, p, n);
                 }
                 cudaGetLastError();
                 p = nullptr;
@@ -1746,6 +1897,8 @@ bool Glm5Model::fast_setup(std::string& err) {
         if (g.n_expert > 512) F->n_ahead = 0;
         const char* ahr = getenv("STRATA_GLM_AHEAD_READ");
         F->ahead_read = F->n_ahead > 0 && (ahr == nullptr || std::atoi(ahr) != 0);
+        // (the host mirror: every key has its RAM copy, so the lookahead predicts and counts but has nothing to read)
+        if (F->host_mirror) F->ahead_read = glmfast::ahead_read_on(true, F->ahead_read);
         std::array<std::array<short, 8>, gf::kAhead> none;
         for (auto& r : none) r.fill(-1);
         F->ah_pred.assign((size_t) NL, none);
@@ -1766,7 +1919,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             bool agree = true;   // arenas on different nodes: no line
             for (const auto& R : F->rc)
                 if (R.base != nullptr && R.n > 0) {
-                    const int node = win_arena_node(R.base, (size_t) R.n * R.stride);
+                    const int node = win_arena_node(R.base, R.part_slots(0) * R.stride);
                     if (node < 0) continue;
                     agree = agree && (tier_node < 0 || node == tier_node);
                     tier_node = node;
@@ -1810,6 +1963,35 @@ bool Glm5Model::fast_setup(std::string& err) {
             std::fprintf(stderr, "glm fast: CUDA%d RAM-resident verified: all %d experts are in VRAM or pinned RAM\n",
                          dev_, total);
         }
+        // the host mirror is all-or-nothing too: after the warm, every active expert has its one permanent host slot -
+        // checked key by key (STRATA_GLM_HOST_MIRROR_VERIFY=1: and every byte, below)
+        if (F->host_mirror) {
+            int64_t total = 0, held = 0;
+            for (int il = l0_; il < lt_; ++il) {
+                if (!F->L[(size_t) il].moe) continue;
+                const auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
+                for (int e = 0; e < g.n_expert; ++e) {
+                    const int key = il * g.n_expert + e;
+                    const int rs = F->ram_of[(size_t) key];
+                    ++total;
+                    held += glmfast::host_copy_valid(key, rs, rs >= 0 ? R.key[(size_t) rs] : -1,
+                                                     rs >= 0 ? R.st[(size_t) rs] : (char) FastState::kRFree);
+                }
+            }
+            if (held != total) {
+                err = "glm fast: STRATA_GLM_HOST_MIRROR=1: " + std::to_string(total - held) + " of " +
+                      std::to_string(total) + " active experts have no host copy after the warm-up";
+                return false;
+            }
+            std::string cls;
+            for (size_t c = 0; c < F->rc.size(); ++c)
+                cls += (c ? ", " : "") + std::to_string(F->rc[c].n) + " x " +
+                       std::to_string(F->rc[c].stride) + " B";
+            std::fprintf(stderr, "glm fast: CUDA%d host mirror: all %lld active experts in pinned RAM for the model's "
+                                 "lifetime (%s; %.2f GB), VRAM seeded from it - an eviction from VRAM copies nothing "
+                                 "back\n", dev_, (long long) total, cls.c_str(), (double) F->ram_bytes / 1073741824.0);
+            if (F->mirror_verify && !host_mirror_verify("after the warm-up", err)) return false;
+        }
         F->lane_pending = true;
         if (!defer_lane_ && !fast_setup_finish(err)) return false;
     }
@@ -1851,7 +2033,8 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
         return false;
     }
     std::vector<std::pair<void*, size_t>> regions;
-    for (const auto& r : F->rc) regions.push_back({r.base, (size_t) r.n * r.stride});
+    for (const auto& r : F->rc)
+        for (size_t i = 0; i < r.n_parts(); ++i) regions.push_back({r.part(i), r.part_slots(i) * r.stride});
     const int device = std::atoi(getenv("STRATA_GLM_EXPERT_HELPER"));
     if (device == dev_ || !F->helper.open(device, g_.n_embd, g_.n_ff_exp, regions, err)) return false;
     std::vector<int> ranked;
@@ -1879,7 +2062,7 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
         auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
         if (R.stride > F->helper.available()) continue;
         const int rs = F->ram_of[(size_t) key];
-        const uint8_t* host = rs >= 0 ? R.base + (size_t) rs * R.stride : F->stage[0];
+        const uint8_t* host = rs >= 0 ? R.slot((size_t) rs) : F->stage[0];
         if (rs < 0) for (int role = 0; role < 3; ++role) fast_read_part(il, e, role, F->stage[0], 0, 1);
         if (!F->helper.insert(key, host, F->L[(size_t) il].blob, R.stride, err)) return false;
         if (F->helper.integrated()) R.st[(size_t) rs] = FastState::kRHelper;
@@ -1937,7 +2120,7 @@ bool Glm5Model::fast_helper_adapt(std::string& err) {
         const int il = s.in / g_.n_expert;
         auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
         const int rs = F->ram_of[(size_t) s.in];
-        const uint8_t* src = rs >= 0 ? R.base + (size_t) rs * R.stride : F->stage[0];
+        const uint8_t* src = rs >= 0 ? R.slot((size_t) rs) : F->stage[0];
         if (rs < 0) for (int role = 0; role < 3; ++role) fast_read_part(il, s.in % g_.n_expert, role, F->stage[0], 0, 1);
         if (!F->helper.replace(s.out, s.in, src, err)) return false;
         if (F->helper.integrated()) {
@@ -1950,7 +2133,7 @@ bool Glm5Model::fast_helper_adapt(std::string& err) {
                 R.tick[(size_t) dst] = F->clock;
                 F->ram_of[(size_t) s.out] = -1;
                 F->ram_of[(size_t) s.in] = dst;
-                const unsigned long long zero = 0, ptr = (unsigned long long) (R.base + (size_t) dst * R.stride);
+                const unsigned long long zero = 0, ptr = (unsigned long long) (R.slot((size_t) dst));
                 if (!glmfast::cuda_ok(cudaMemcpy(F->tab + F->rtab_key(s.out), &zero, sizeof(zero), cudaMemcpyHostToDevice),
                                      "helper old RAM entry", err) ||
                     !glmfast::cuda_ok(cudaMemcpy(F->tab + F->rtab_key(s.in), &ptr, sizeof(ptr), cudaMemcpyHostToDevice),
@@ -2856,7 +3039,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     std::vector<const uint8_t*> cal_all;
     for (int s = 0; s < R.n && (int) cal_all.size() < 4 * kCalSets; ++s)
         if (R.st[(size_t) s] == FastState::kRHold && R.key[(size_t) s] / g.n_expert == il_cal)
-            cal_all.push_back(R.base + (size_t) s * R.stride);
+            cal_all.push_back(R.slot((size_t) s));
     if (cal_all.empty()) {   // nothing in RAM: the lane would never run (a complete pool: every expert in VRAM)
         std::fprintf(stderr, "glm fast: CUDA%d CPU lane off: the RAM tier holds no expert\n", dev_);
         return true;
@@ -3473,6 +3656,7 @@ bool Glm5Model::fast_warm(std::string& err) {
         int il, e;
         uint8_t* dst;    // the RAM slot, or the VRAM slot (staged)
         bool vram;
+        uint8_t* seed = nullptr;   // the host mirror: the VRAM slot copied from this job's RAM slot once it is read
     };
     std::vector<Job> jobs;
     const size_t N = (size_t) F->n_keys;
@@ -3489,7 +3673,7 @@ bool Glm5Model::fast_warm(std::string& err) {
             P.st[(size_t) j] = FastState::kResident;
             F->slot_of[(size_t) key] = j;
             th[(size_t) key] = (unsigned long long) P.slot_ptr(j);
-            jobs.push_back(Job{il, e, P.slot_ptr(j), true});
+            if (!F->host_mirror) jobs.push_back(Job{il, e, P.slot_ptr(j), true});   // (the mirror: seeded below)
         }
         next[(size_t) il] = nv;
     }
@@ -3502,7 +3686,8 @@ bool Glm5Model::fast_warm(std::string& err) {
             if (!F->L[(size_t) il].moe || next[(size_t) il] >= g.n_expert) continue;
             const int c = F->layer_rc[(size_t) il];
             auto& R = F->rc[(size_t) c];
-            if (rfree[(size_t) c] <= (F->ram_resident ? 0 : 4)) continue;   // resident: no disk-read slots to keep
+            // (resident and the mirror: no disk-read slots to keep)
+            if (rfree[(size_t) c] <= glmfast::warm_ram_reserve(F->host_mirror, F->ram_resident)) continue;
             while (rcur[(size_t) c] < R.n && R.st[(size_t) rcur[(size_t) c]] != FastState::kRFree) ++rcur[(size_t) c];
             if (rcur[(size_t) c] >= R.n) continue;
             const int s = rcur[(size_t) c]++;
@@ -3511,12 +3696,45 @@ bool Glm5Model::fast_warm(std::string& err) {
             R.key[(size_t) s] = key;
             R.st[(size_t) s] = FastState::kRHold;
             F->ram_of[(size_t) key] = s;
-            th[N + (size_t) key] = (unsigned long long) (R.base + (size_t) s * R.stride);
-            jobs.push_back(Job{il, e, R.base + (size_t) s * R.stride, false});
+            th[N + (size_t) key] = (unsigned long long) (R.slot((size_t) s));
+            jobs.push_back(Job{il, e, R.slot((size_t) s), false});
             --rfree[(size_t) c];
             progress = true;
         }
     }
+    // the host mirror: the VRAM residents' permanent copies after them (the RAM-only experts keep the slots the
+    // exclusive tiers would give them), each expert read ONCE into its host slot and its VRAM slot seeded from those
+    // same bytes - the ranked placement and the spares as without the mirror
+    if (F->host_mirror)
+        for (int il = l0_; il < lt_; ++il) {
+            if (!F->L[(size_t) il].moe) continue;
+            auto& P = F->lp[(size_t) il];
+            const int c = F->layer_rc[(size_t) il];
+            auto& R = F->rc[(size_t) c];
+            if (next[(size_t) il] < g.n_expert) {
+                err = "glm fast: STRATA_GLM_HOST_MIRROR=1: layer " + std::to_string(il) + " has " +
+                      std::to_string(g.n_expert - next[(size_t) il]) + " experts without a host slot";
+                return false;
+            }
+            for (int j = 0; j < P.n; ++j) {
+                if (P.st[(size_t) j] != FastState::kResident || P.key[(size_t) j] < 0) continue;
+                const int e = P.key[(size_t) j];
+                const int key = il * g.n_expert + e;
+                while (rcur[(size_t) c] < R.n && R.st[(size_t) rcur[(size_t) c]] != FastState::kRFree) ++rcur[(size_t) c];
+                if (rcur[(size_t) c] >= R.n) {
+                    err = "glm fast: STRATA_GLM_HOST_MIRROR=1: RAM class " + std::to_string(c) +
+                          " has no slot left for layer " + std::to_string(il) + "'s VRAM residents";
+                    return false;
+                }
+                const int s = rcur[(size_t) c]++;
+                R.key[(size_t) s] = key;
+                R.st[(size_t) s] = FastState::kRHold;
+                F->ram_of[(size_t) key] = s;
+                th[N + (size_t) key] = (unsigned long long) (R.base + (size_t) s * R.stride);
+                jobs.push_back(Job{il, e, R.base + (size_t) s * R.stride, false, P.slot_ptr(j)});
+                --rfree[(size_t) c];
+            }
+        }
     // Experts in file order: the warm-up reads whole experts, and in the order the routes rank
     // them (layer round-robin), reads seek all over the model's files (a cold read from a disk at ~0.05-0.10 GB/s).
     // Sorting jobs by physical (shard, offset) turns ~37,000 random seeks into sequential streaming.
@@ -3559,9 +3777,15 @@ bool Glm5Model::fast_warm(std::string& err) {
             const Job& J = jobs[b + (size_t) k];
             if (J.vram)
                 cudaMemcpyAsync(J.dst, F->stage[(size_t) k], F->L[(size_t) J.il].blob, cudaMemcpyHostToDevice, F->copy);
+            else if (J.seed != nullptr)   // (the host mirror: the VRAM slot from the host slot just read)
+                cudaMemcpyAsync(J.seed, J.dst, F->L[(size_t) J.il].blob, cudaMemcpyHostToDevice, F->copy);
             done_bytes += F->L[(size_t) J.il].blob;
         }
-        cudaStreamSynchronize(F->copy);
+        const cudaError_t se = cudaStreamSynchronize(F->copy);
+        if (F->host_mirror && se != cudaSuccess) {
+            err = std::string("glm fast: the host mirror's VRAM seeding failed (") + cudaGetErrorString(se) + ")";
+            return false;
+        }
         const int pct = (int) (100.0 * (double) done_bytes / (double) std::max<size_t>(1, total_bytes));
         if (pct / 10 != last_pct / 10) {
             last_pct = pct;
@@ -3698,9 +3922,12 @@ void Glm5Model::fast_destroy() {
                      (unsigned long long) F->kda_graphs.replays,
                      (unsigned long long) F->kda_graphs.invalidations);
     F->kda_graphs.clear();   // before the graph's buffers and streams are freed
+    // (the host mirror: the prefetch stream reads RAM-tier blobs too - idle before the arenas go)
+    if (F->host_mirror && F->ps) cudaStreamSynchronize(F->ps);
     for (auto& R : F->rc)
         if (R.base && R.registered) numa_pinned_free(R.base, (size_t) R.n * R.stride);
-        else if (R.base) cudaFreeHost(R.base);
+        else
+            for (size_t i = 0; i < R.n_parts(); ++i) cudaFreeHost(R.part(i));
     for (auto& d : F->draining) cudaEventDestroy(d.ev);
     for (auto& m : F->bg) cudaEventDestroy(m.ev);
     for (auto e : F->ev_free) cudaEventDestroy(e);
@@ -3875,6 +4102,16 @@ bool Glm5Model::set_cpu_lane_threads(int n) {
 void Glm5Model::set_miss_skip(double w, int from) {
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
         if (m->fast_ != nullptr) {
+            // the host mirror refuses a request's light-miss bar as it refuses STRATA_GLM_MISS_SKIP_W at the start: which
+            // experts are not in VRAM follows the mirror's residency, so leaving them out would too
+            if (m->fast_->host_mirror && w > 0.0) {
+                static bool said = false;
+                if (!said) {
+                    said = true;
+                    std::fprintf(stderr, "glm fast: STRATA_GLM_HOST_MIRROR=1: a request's miss_skip_w is ignored\n");
+                }
+                continue;
+            }
             m->fast_->miss_w_req = w >= 0.0 ? (float) std::min(1.0, w) : -1.0f;
             m->fast_->miss_from_req = from >= 0 ? from : -1;
         }
@@ -3910,6 +4147,12 @@ Glm5Model::FastStats Glm5Model::fast_stats() const {
             s.ram_slots += R.n;
             for (char c : R.st) s.ram_used += c == FastState::kRHold || c == FastState::kRNew || c == FastState::kRHelper;
         }
+        for (int p = 0; p < 3; ++p) {
+            s.evict_d2h[p] += F->evict_d2h[p].load(std::memory_order_relaxed);
+            s.evict_d2h_bytes[p] += F->evict_d2h_bytes[p].load(std::memory_order_relaxed);
+            s.mirror_retired[p] += F->mirror_retired[p].load(std::memory_order_relaxed);
+        }
+        s.mirror_broken += F->mirror_broken.load(std::memory_order_relaxed);
     }
     if (fast_ != nullptr) {
         s.tokens = fast_->tokens;
@@ -3955,6 +4198,154 @@ std::vector<Glm5Model::VramReport> Glm5Model::vram_report() const {
     }
     cudaSetDevice(cur);
     return out;
+}
+
+// STRATA_GLM_HOST_MIRROR_VERIFY=1: the host mirror checked in full, for diagnostics runs only (glm_model.hpp).  Every
+// stream idle and the service thread caught up first; then, under the tier lock: (a) each active key has exactly one
+// valid permanent host slot, the device's RAM table points at it and its VRAM table at the slot the host books (or at
+// nothing); (b) every VRAM slot holding an expert - resident, or a background promotion landed but not adopted yet -
+// equals its host copy byte for byte; (c) every host copy equals the pack's bytes, read again through fast_read_part
+// (not the warm-up's coalescing reader), byte for byte.  The D2H reads of (b) are expert-sized: never with a profiler
+// that counts eviction copies.
+bool Glm5Model::host_mirror_verify(const char* phase, std::string& err) {
+    FastState* F = fast_;
+    if (F == nullptr || !F->host_mirror || !F->mirror_verify) return true;
+    cudaSetDevice(dev_);
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm mirror verify: compute", err) ||
+        !glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "glm mirror verify: copies", err) ||
+        !glmfast::cuda_ok(cudaStreamSynchronize(F->ps), "glm mirror verify: prefetch", err))
+        return false;
+    while (F->processed.load(std::memory_order_acquire) < F->expected) cpu_relax();
+    std::lock_guard<std::mutex> lk(F->mu);
+    const Glm5Geometry& g = g_;
+    const int NE = g.n_expert;
+    const size_t N = (size_t) F->n_keys;
+    const auto host_of = [&](int key, const FastState::RamClass& R) {
+        const int rs = F->ram_of[(size_t) key];
+        return glmfast::host_copy_valid(key, rs, rs >= 0 ? R.key[(size_t) rs] : -1,
+                                        rs >= 0 ? R.st[(size_t) rs] : (char) FastState::kRFree)
+                   ? R.base + (size_t) rs * R.stride
+                   : nullptr;
+    };
+    std::vector<unsigned long long> tab(2 * N, 0ull);
+    if (!glmfast::cuda_ok(cudaMemcpy(tab.data(), F->tab, 2 * N * sizeof(unsigned long long), cudaMemcpyDeviceToHost),
+                          "glm mirror verify: tables", err))
+        return false;
+    // (a) coverage and tables
+    std::vector<int> copies(N, 0);
+    uint64_t stray = 0;   // a RAM slot in use without a key
+    for (const auto& R : F->rc)
+        for (int s = 0; s < R.n; ++s) {
+            const int k = R.key[(size_t) s];
+            if (k >= 0 && (size_t) k < N) ++copies[(size_t) k];
+            else if (R.st[(size_t) s] != FastState::kRFree) ++stray;
+        }
+    uint64_t keys = 0, missing = 0, dup = 0, rtab_bad = 0, tab_bad = 0, pinned = 0;
+    std::vector<int> keylist;
+    for (int il = l0_; il < lt_; ++il) {
+        if (!F->L[(size_t) il].moe) continue;
+        const auto& P = F->lp[(size_t) il];
+        const auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
+        for (int e = 0; e < NE; ++e) {
+            const int key = il * NE + e;
+            ++keys;
+            const uint8_t* h = host_of(key, R);
+            missing += h == nullptr;
+            dup += copies[(size_t) key] != 1;
+            if (h != nullptr) {
+                pinned += R.st[(size_t) F->ram_of[(size_t) key]] == FastState::kRPin;
+                rtab_bad += tab[N + (size_t) key] != (unsigned long long) h;
+                keylist.push_back(key);
+            }
+            const int vs = F->slot_of[(size_t) key];
+            const unsigned long long want = vs >= 0 && vs < P.n ? (unsigned long long) P.slot_ptr(vs) : 0ull;
+            tab_bad += tab[(size_t) key] != want ||
+                       (vs >= 0 && (vs >= P.n || P.st[(size_t) vs] != FastState::kResident || P.key[(size_t) vs] != e));
+        }
+    }
+    // (b) every VRAM copy against its host copy (through the pinned staging); and the orphan duplicates, resident
+    //     slots whose key is booked at another slot or none (counted, not a failure: glm_host_mirror.hpp vram_orphan)
+    uint64_t vram_n = 0, vram_bad = 0, landing = 0, orphan = 0;
+    for (int il = l0_; il < lt_; ++il) {
+        if (!F->L[(size_t) il].moe) continue;
+        const auto& P = F->lp[(size_t) il];
+        const auto& Ly = F->L[(size_t) il];
+        const auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
+        for (int s = 0; s < P.n; ++s) {
+            int e = -1;
+            if (P.st[(size_t) s] == FastState::kResident && P.key[(size_t) s] >= 0) {
+                e = P.key[(size_t) s];
+                orphan += glmfast::vram_orphan(true, F->slot_of[(size_t) (il * NE + e)], s);
+            } else if (P.st[(size_t) s] == FastState::kLanding) {
+                for (const auto& m : F->bg)
+                    if (m.up && m.il == il && m.vslot == s) e = m.key % NE;
+                landing += e >= 0;
+            }
+            if (e < 0) continue;
+            const uint8_t* h = host_of(il * NE + e, R);
+            if (h == nullptr) continue;   // (counted in (a))
+            if (!glmfast::cuda_ok(cudaMemcpy(F->stage[0], P.slot_ptr(s), Ly.blob, cudaMemcpyDeviceToHost),
+                                  "glm mirror verify: a VRAM copy", err))
+                return false;
+            ++vram_n;
+            vram_bad += std::memcmp(F->stage[0], h, Ly.blob) != 0;
+        }
+    }
+    // (c) every host copy against the pack, eight experts at a time on the disk workers (each part's bytes poisoned
+    //     first, so a read that wrote nothing cannot pass)
+    size_t blob_max = 0;
+    for (int il = l0_; il < lt_; ++il)
+        if (F->L[(size_t) il].moe) blob_max = std::max(blob_max, F->L[(size_t) il].blob);
+    constexpr int W = 8;
+    std::vector<std::vector<uint8_t>> buf((size_t) W, std::vector<uint8_t>(blob_max));
+    std::array<std::atomic<int>, W> differs{};
+    uint64_t host_n = 0, host_bad = 0;
+    // (in file order, as the warm-up reads: sequential streaming instead of seeks)
+    const auto file_pos = [&](int key) {
+        const int il = key / NE, e = key % NE;
+        const auto& nl = pack_layers_[(size_t) il];
+        return std::make_pair((int) (nl.x_cb >= 0 ? nl.x_shard[(size_t) e * 9] : nl.gate_shard),
+                              (uint64_t) (nl.x_cb >= 0 ? nl.x_off[(size_t) e * 9]
+                                                       : nl.gate_off + (uint64_t) e * F->L[(size_t) il].gu_bytes));
+    };
+    std::stable_sort(keylist.begin(), keylist.end(), [&](int a, int b) { return file_pos(a) < file_pos(b); });
+    for (size_t b = 0; b < keylist.size(); b += W) {
+        const int nb = (int) std::min<size_t>(W, keylist.size() - b);
+        for (auto& d : differs) d.store(0, std::memory_order_relaxed);
+        F->workers->run(nb * 3, [&](int job) {
+            const int key = keylist[b + (size_t) (job / 3)], role = job % 3;
+            const int il = key / NE, e = key % NE;
+            const auto& Ly = F->L[(size_t) il];
+            const size_t off = role == 0 ? 0 : role == 1 ? Ly.gu_bytes : Ly.down_off;
+            const size_t len = role == 2 ? Ly.dn_bytes : Ly.gu_bytes;
+            uint8_t* d = buf[(size_t) (job / 3)].data();
+            std::memset(d + off, 0xA5, len);
+            fast_read_part(il, e, role, d, 0, 1);
+            const uint8_t* h = host_of(key, F->rc[(size_t) F->layer_rc[(size_t) il]]);
+            if (h == nullptr || std::memcmp(d + off, h + off, len) != 0)
+                differs[(size_t) (job / 3)].store(1, std::memory_order_relaxed);
+        });
+        for (int k = 0; k < nb; ++k) host_bad += (uint64_t) differs[(size_t) k].load(std::memory_order_relaxed);
+        host_n += (uint64_t) nb;
+    }
+    const uint64_t broken = F->mirror_broken.load(std::memory_order_relaxed);
+    const bool pass = missing == 0 && dup == 0 && stray == 0 && rtab_bad == 0 && tab_bad == 0 && vram_bad == 0 &&
+                      host_bad == 0 && host_n == keys && broken == 0;
+    const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::fprintf(stderr,
+                 "glm host mirror verify CUDA%d %s: %s - %llu keys: %llu without a valid host copy, %llu not in exactly "
+                 "one slot, %llu stray RAM slots, %llu RAM-table and %llu VRAM-table entries wrong | VRAM copies %llu "
+                 "compared (%llu landing), %llu differ, %llu orphan duplicate residents | host copies %llu compared with "
+                 "the pack, %llu differ | %llu host slots pinned by background moves, %llu invariant failures so far | "
+                 "%.1f s\n",
+                 dev_, phase, pass ? "PASS" : "FAIL", (unsigned long long) keys, (unsigned long long) missing,
+                 (unsigned long long) dup, (unsigned long long) stray, (unsigned long long) rtab_bad,
+                 (unsigned long long) tab_bad, (unsigned long long) vram_n, (unsigned long long) landing,
+                 (unsigned long long) vram_bad, (unsigned long long) orphan, (unsigned long long) host_n,
+                 (unsigned long long) host_bad, (unsigned long long) pinned, (unsigned long long) broken, sec);
+    if (!pass) err = std::string("glm host mirror verify failed ") + phase;
+    return pass;
 }
 
 // ---------------------------------------------------------------- the service thread
@@ -4126,9 +4517,11 @@ void Glm5Model::fast_service() {
                             if (P.spare[j] == s) P.spare[j] = -1;
                         F->promotions.fetch_add(1, std::memory_order_relaxed);
                     }
-                    // exclusive tiers: its RAM copy is released at the next boundary (the fetch reads it now)
+                    // exclusive tiers: its RAM copy is released at the next boundary (the fetch reads it now); the host
+                    // mirror keeps it (glmfast::ram_release_on_promotion)
                     const int rs = F->ram_of[(size_t) key];
-                    if (rs >= 0 && R.st[(size_t) rs] == FastState::kRHold) R.st[(size_t) rs] = FastState::kRRelease;
+                    if (rs >= 0 && glmfast::ram_release_on_promotion(F->host_mirror, R.st[(size_t) rs]))
+                        R.st[(size_t) rs] = FastState::kRRelease;
                 } else if (((fetch | miss) >> i) & 1u) {
                     F->scratch_uses.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -4176,7 +4569,8 @@ void Glm5Model::fast_service() {
                     for (int j = 0; j < gf::kSpares; ++j)
                         if (P1.spare[j] == s) P1.spare[j] = -1;
                     const int rs = F->ram_of[(size_t) key];
-                    if (rs >= 0 && R1.st[(size_t) rs] == FastState::kRHold) R1.st[(size_t) rs] = FastState::kRRelease;
+                    if (rs >= 0 && glmfast::ram_release_on_promotion(F->host_mirror, R1.st[(size_t) rs]))
+                        R1.st[(size_t) rs] = FastState::kRRelease;
                     F->prefetches.fetch_add(1, std::memory_order_relaxed);
                 }
             }
@@ -4196,8 +4590,18 @@ void Glm5Model::fast_service() {
                 for (int m = 0; m < nm; ++m) {
                     const int key = il * g.n_expert + ids[mi[m]];
                     int rs = F->ram_of[(size_t) key];
+                    // the host mirror: every active expert has its host copy, so a disk-only route is a broken invariant
+                    // - counted, said once, and answered from the pinned staging without touching the RAM tier
+                    if (F->host_mirror) {
+                        if (F->mirror_broken.fetch_add(1, std::memory_order_relaxed) == 0)
+                            std::fprintf(stderr, "glm fast: CUDA%d ERROR - STRATA_GLM_HOST_MIRROR=1: layer %d expert %d "
+                                                 "has no host copy (read from disk into staging)\n", dev_, il, ids[mi[m]]);
+                        rd[nr++] = m;
+                        dst[m] = F->stage[(size_t) m];
+                        continue;
+                    }
                     if (rs >= 0 && (R.st[(size_t) rs] == FastState::kRLoad || R.st[(size_t) rs] == FastState::kRNew)) {
-                        dst[m] = R.base + (size_t) rs * R.stride;
+                        dst[m] = R.slot((size_t) rs);
                         if (R.st[(size_t) rs] == FastState::kRLoad) {
                             auto& ld = F->rload[(size_t) cls][(size_t) rs];
                             uint64_t v = ld.load(std::memory_order_acquire);
@@ -4234,7 +4638,7 @@ void Glm5Model::fast_service() {
                                 break;
                             }
                         if (draining) {
-                            dst[m] = R.base + (size_t) rs * R.stride;
+                            dst[m] = R.slot((size_t) rs);
                             continue;
                         }
                     }
@@ -4250,7 +4654,7 @@ void Glm5Model::fast_service() {
                         R.tick[(size_t) rs] = F->clock;
                         R.st[(size_t) rs] = ((promo >> mi[m]) & 1u) ? FastState::kRRelease : FastState::kRNew;
                         F->ram_of[(size_t) key] = ((promo >> mi[m]) & 1u) ? -1 : rs;
-                        dst[m] = R.base + (size_t) rs * R.stride;
+                        dst[m] = R.slot((size_t) rs);
                         if ((promo >> mi[m]) & 1u) R.key[(size_t) rs] = -1;   // a pure staging use: freed at the boundary
                     } else {
                         dst[m] = F->stage[(size_t) m];
@@ -4565,7 +4969,7 @@ void Glm5Model::fast_ahead_reader() {
         auto& ld = F->rload[(size_t) j.rclass][(size_t) j.rslot];
         uint64_t want = j.tag << 2;
         if (ld.compare_exchange_strong(want, (j.tag << 2) | 1u, std::memory_order_acq_rel)) {
-            uint8_t* blob = F->rc[(size_t) j.rclass].base + (size_t) j.rslot * F->rc[(size_t) j.rclass].stride;
+            uint8_t* blob = F->rc[(size_t) j.rclass].slot((size_t) j.rslot);
             for (int role = 0; role < 3; ++role) fast_read_part(j.il, j.e, role, blob);
             ld.store((j.tag << 2) | 2u, std::memory_order_release);
         }
@@ -4644,7 +5048,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
         uint32_t bc = UINT32_MAX;
         uint64_t bt = UINT64_MAX;
         for (int s = 0; s < R.n; ++s) {
-            if (R.st[(size_t) s] != FastState::kRHold) continue;
+            if (!glmfast::ram_victim_eligible(F->host_mirror, R.st[(size_t) s])) continue;   // (the mirror: none)
             const uint64_t t = R.tick[(size_t) s];
             if (t < bt) {
                 bt = t;
@@ -4672,7 +5076,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 // a LOOKAHEAD read nobody asked for yet: in the RAM tier once it landed
                 if ((F->rload[c][(size_t) s].load(std::memory_order_acquire) & 3u) == 2u) {
                     R.st[(size_t) s] = FastState::kRHold;
-                    upd(F->rtab_key(R.key[(size_t) s]), (unsigned long long) (R.base + (size_t) s * R.stride));
+                    upd(F->rtab_key(R.key[(size_t) s]), (unsigned long long) (R.slot((size_t) s)));
                 }
             } else if (R.st[(size_t) s] == FastState::kRRelease) {
                 const int key = R.key[(size_t) s];
@@ -4684,8 +5088,8 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 R.st[(size_t) s] = FastState::kRFree;
             } else if (R.st[(size_t) s] == FastState::kRNew) {
                 R.st[(size_t) s] = FastState::kRHold;
-                upd(F->rtab_key(R.key[(size_t) s]), (unsigned long long) (R.base + (size_t) s * R.stride));
-            } else if (R.st[(size_t) s] == FastState::kRHold && tier_gc) {
+                upd(F->rtab_key(R.key[(size_t) s]), (unsigned long long) (R.slot((size_t) s)));
+            } else if (glmfast::ram_gc_applies(F->host_mirror, tier_gc, R.st[(size_t) s])) {   // (the mirror: never)
                 // exclusive tiers, kept (STRATA_GLM_TIER_GC=0: not): a held copy the tables lost (a route promoted or re-read the expert while its
                 // demotion was still landing, which then held a second copy nothing points at) or of an expert VRAM
                 // holds is freed; one that is the expert's only copy is adopted back.  Such copies piled up to ~12%
@@ -4695,7 +5099,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 if (key >= 0 && ro == s && F->slot_of[(size_t) key] < 0) continue;   // the normal case
                 if (key >= 0 && ro < 0 && F->slot_of[(size_t) key] < 0) {
                     F->ram_of[(size_t) key] = s;
-                    upd(F->rtab_key(key), (unsigned long long) (R.base + (size_t) s * R.stride));
+                    upd(F->rtab_key(key), (unsigned long long) (R.slot((size_t) s)));
                     ++F->diag_adopt;
                     continue;
                 }
@@ -4722,7 +5126,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
         auto& R = F->rc[(size_t) d.rclass];
         if (R.st[(size_t) d.rslot] == FastState::kRDemote && R.key[(size_t) d.rslot] == d.key) {
             R.st[(size_t) d.rslot] = FastState::kRHold;
-            upd(F->rtab_key(d.key), (unsigned long long) (R.base + (size_t) d.rslot * R.stride));
+            upd(F->rtab_key(d.key), (unsigned long long) (R.slot((size_t) d.rslot)));
             if (F->ram_resident) {   // the deferred half of the move: forget the VRAM copy only now
                 upd(F->tab_key((size_t) d.key), 0ull);
                 F->slot_of[(size_t) d.key] = -1;
@@ -4784,6 +5188,30 @@ bool Glm5Model::fast_boundary(std::string& err) {
             }
             if (v < 0) break;
             const int vkey = il * g.n_expert + P.key[(size_t) v];
+            // the host mirror: the expert keeps its permanent host copy, so the eviction only retires the VRAM copy - no
+            // RAM slot, no victim, no D2H.  The slot is a spare at once, as a drop's is below: this boundary has the
+            // compute stream idle and the service caught up, and the table edit forgetting the expert reaches the
+            // device (flush, on the compute stream) before any route of the next token
+            if (F->host_mirror) {
+                const int hs = F->ram_of[(size_t) vkey];
+                const bool host_ok = glmfast::host_copy_valid(vkey, hs, hs >= 0 ? R.key[(size_t) hs] : -1,
+                                                              hs >= 0 ? R.st[(size_t) hs] : (char) FastState::kRFree);
+                if (glmfast::evict_mode(true, host_ok) != glmfast::Evict::kRetire) {
+                    F->mirror_broken.fetch_add(1, std::memory_order_relaxed);
+                    err = "glm fast: STRATA_GLM_HOST_MIRROR=1: layer " + std::to_string(il) + " expert " +
+                          std::to_string(P.key[(size_t) v]) + " leaves VRAM without its host copy";
+                    return false;
+                }
+                upd(F->tab_key(vkey), 0ull);
+                F->slot_of[(size_t) vkey] = -1;
+                ++P.evictions;
+                P.st[(size_t) v] = FastState::kSpare;
+                P.key[(size_t) v] = -1;
+                P.spare[j] = v;
+                upd(F->spare_key(il, j), (unsigned long long) P.slot_ptr(v));
+                F->mirror_retired[0].fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
             // demote it into the RAM tier: a free slot, else the RAM tier's victim (if colder than it)
             int rs = -1;
             uint32_t rc_min = UINT32_MAX;
@@ -4821,8 +5249,10 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 R.tick[(size_t) rs] = F->clock;
                 R.st[(size_t) rs] = FastState::kRDemote;
                 F->ram_of[(size_t) vkey] = rs;
-                cudaMemcpyAsync(R.base + (size_t) rs * R.stride, P.slot_ptr(v),
+                cudaMemcpyAsync(R.slot((size_t) rs), P.slot_ptr(v),
                                 F->L[(size_t) il].blob, cudaMemcpyDeviceToHost, F->copy);
+                F->evict_d2h[0].fetch_add(1, std::memory_order_relaxed);
+                F->evict_d2h_bytes[0].fetch_add(F->L[(size_t) il].blob, std::memory_order_relaxed);
                 cudaEvent_t ev = F->get_event();
                 cudaEventRecord(ev, F->copy);
                 F->draining.push_back(FastState::Drain{il, v, vkey, F->layer_rc[(size_t) il], rs, ev});
@@ -4843,9 +5273,10 @@ bool Glm5Model::fast_boundary(std::string& err) {
         }
     }
     // (4) a few free RAM slots per class for the next token's disk reads (and its reads ahead); RAM-resident
-    // mode plans no disk reads, so no residents are evicted to keep landing room either
+    // mode plans no disk reads, so no residents are evicted to keep landing room either - nor does the host mirror,
+    // whose slots are never victims (glmfast::ram_keep_free)
     static const char* kf = getenv("STRATA_GLM_RAM_FREE");
-    const int keep_free = F->ram_resident ? 0 : kf ? std::max(1, std::atoi(kf)) : F->ahead_read ? 12 : 4;
+    const int keep_free = glmfast::ram_keep_free(F->host_mirror, F->ram_resident, kf, F->ahead_read);
     for (auto& R : F->rc) {
         int nfree = 0;
         for (char c : R.st) nfree += c == FastState::kRFree;
@@ -4889,12 +5320,16 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 P.tick[(size_t) m.vslot] = F->clock;
                 F->slot_of[(size_t) m.key] = m.vslot;
                 upd(F->tab_key((size_t) m.key), (unsigned long long) P.slot_ptr(m.vslot));
+                // the exclusive tiers free the source slot and forget the RAM copy; the host mirror makes the source its
+                // readable permanent copy again and keeps ram_of and the RAM table (glmfast::bg_up_*)
                 if (R.st[(size_t) m.rslot] == FastState::kRPin) {
-                    R.st[(size_t) m.rslot] = FastState::kRFree;
-                    R.key[(size_t) m.rslot] = -1;
+                    R.st[(size_t) m.rslot] = glmfast::bg_up_source_after(F->host_mirror, R.st[(size_t) m.rslot]);
+                    if (glmfast::bg_up_clears_ram_entry(F->host_mirror)) R.key[(size_t) m.rslot] = -1;
                 }
-                if (F->ram_of[(size_t) m.key] == m.rslot) F->ram_of[(size_t) m.key] = -1;
-                upd(F->rtab_key((size_t) m.key), 0ull);
+                if (glmfast::bg_up_clears_ram_entry(F->host_mirror)) {
+                    if (F->ram_of[(size_t) m.key] == m.rslot) F->ram_of[(size_t) m.key] = -1;
+                    upd(F->rtab_key((size_t) m.key), 0ull);
+                }
                 ++F->bg_up;
             } else {
                 upd(F->tab_key((size_t) m.key), 0ull);
@@ -4906,7 +5341,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 R.st[(size_t) m.rslot] = FastState::kRHold;
                 R.tick[(size_t) m.rslot] = F->clock;
                 F->ram_of[(size_t) m.key] = m.rslot;
-                upd(F->rtab_key((size_t) m.key), (unsigned long long) (R.base + (size_t) m.rslot * R.stride));
+                upd(F->rtab_key((size_t) m.key), (unsigned long long) (R.slot((size_t) m.rslot)));
                 ++F->bg_down;
             }
             F->ev_free.push_back(m.ev);
@@ -5005,13 +5440,36 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 if (c.free_slot >= 0) {
                     P.st[(size_t) c.free_slot] = FastState::kLanding;
                     R.st[(size_t) c.rs] = FastState::kRPin;
-                    cudaMemcpyAsync(P.slot_ptr(c.free_slot), R.base + (size_t) c.rs * R.stride, F->L[(size_t) c.il].blob,
+                    cudaMemcpyAsync(P.slot_ptr(c.free_slot), R.slot((size_t) c.rs), F->L[(size_t) c.il].blob,
                                     cudaMemcpyHostToDevice, F->copy);
                     cudaEvent_t ev = F->get_event();
                     cudaEventRecord(ev, F->copy);
                     F->bg.push_back(FastState::BgMove{c.il, c.free_slot, c.il * NE + c.e, rc, c.rs, true, ev});
                     ++filled;
                 } else if (lane_all && c.cold_slot >= 0 && c.hot >= bg_ratio * std::max<uint32_t>(c.cold, 1u) + 4u) {
+                    if (F->host_mirror) {
+                        // the host mirror: the cold resident keeps its permanent host copy, so only its VRAM copy is
+                        // retired - no RAM slot, no D2H - at this boundary, as a spare refill's is; the freed slot takes
+                        // the hot expert at a later boundary's refill, as the exclusive tiers' landed demotion does
+                        const int vkey = c.il * NE + P.key[(size_t) c.cold_slot];
+                        const int hs = F->ram_of[(size_t) vkey];
+                        const bool host_ok = glmfast::host_copy_valid(vkey, hs, hs >= 0 ? R.key[(size_t) hs] : -1,
+                                                                      hs >= 0 ? R.st[(size_t) hs] : (char) FastState::kRFree);
+                        if (glmfast::evict_mode(true, host_ok) != glmfast::Evict::kRetire) {
+                            F->mirror_broken.fetch_add(1, std::memory_order_relaxed);
+                            err = "glm fast: STRATA_GLM_HOST_MIRROR=1: layer " + std::to_string(c.il) + " expert " +
+                                  std::to_string(P.key[(size_t) c.cold_slot]) + " leaves VRAM without its host copy";
+                            return false;
+                        }
+                        upd(F->tab_key((size_t) vkey), 0ull);
+                        if (F->slot_of[(size_t) vkey] == c.cold_slot) F->slot_of[(size_t) vkey] = -1;
+                        P.st[(size_t) c.cold_slot] = FastState::kFree;
+                        P.key[(size_t) c.cold_slot] = -1;
+                        ++F->bg_down;
+                        F->mirror_retired[1].fetch_add(1, std::memory_order_relaxed);
+                        ++issued;
+                        continue;
+                    }
                     int rs = -1;
                     for (int s2 = 0; s2 < R.n && rs < 0; ++s2)
                         if (R.st[(size_t) s2] == FastState::kRFree) rs = s2;
@@ -5020,8 +5478,10 @@ bool Glm5Model::fast_boundary(std::string& err) {
                     P.st[(size_t) c.cold_slot] = FastState::kDraining;   // (still live in VRAM until the copy landed)
                     R.st[(size_t) rs] = FastState::kRDemote;
                     R.key[(size_t) rs] = vkey;
-                    cudaMemcpyAsync(R.base + (size_t) rs * R.stride, P.slot_ptr(c.cold_slot), F->L[(size_t) c.il].blob,
+                    cudaMemcpyAsync(R.slot((size_t) rs), P.slot_ptr(c.cold_slot), F->L[(size_t) c.il].blob,
                                     cudaMemcpyDeviceToHost, F->copy);
+                    F->evict_d2h[1].fetch_add(1, std::memory_order_relaxed);
+                    F->evict_d2h_bytes[1].fetch_add(F->L[(size_t) c.il].blob, std::memory_order_relaxed);
                     cudaEvent_t ev = F->get_event();
                     cudaEventRecord(ev, F->copy);
                     F->bg.push_back(FastState::BgMove{c.il, c.cold_slot, vkey, rc, rs, false, ev});
@@ -5686,7 +6146,8 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
 //     from token_embd there (embed_tok: the host's floats) and the step queues behind the one before it with no host
 //     round trip.  Else the host dequantizes the token's row: through mtp_emb_h where the chain is set up (its last
 //     copy out waited for alone), else through emb_h after a sync of the stream (it may still feed an earlier copy).
-bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step, bool sub, bool read_back) {
+bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step, bool sub, bool read_back,
+                         const float* emb_staged, bool head) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     cudaStream_t s = F->cs;
@@ -5705,6 +6166,8 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step
             return false;
         }
         gf::embed_tok(F->mtp_emb, F->mtp_emb_type, (int) g.n_vocab, F->mtp_tok + step - 1, E, F->emb, s);
+    } else if (emb_staged != nullptr) {   // (the caller's pinned row, kept until this step ran)
+        cudaMemcpyAsync(F->emb, emb_staged, (size_t) E * sizeof(float), cudaMemcpyHostToDevice, s);
     } else {
         const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
         if (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr) {
@@ -5739,6 +6202,7 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step
     bool pf_pending = false;
     if (!fast_moe(il, pf_pending, err)) return false;
     gf::rms_q8(F->mtp_h, F->ffn, Ly.shnorm, g.norm_eps, E, F->head_x, F->head_xq, s);
+    if (!head) return true;   // (the caller runs the head: several conversations' steps through it at once)
     const WSlot& ow = ws_map_.at("output.weight");
     gf::MvJob o[2];
     o[0] = {ow.q, F->head_xq, F->head_x, F->mtp_logits, nullptr, 1.0f, ow.type, E, g.n_vocab};
